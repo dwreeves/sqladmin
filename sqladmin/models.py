@@ -9,6 +9,7 @@ from typing import (
     List,
     Optional,
     Sequence,
+    TypeVar,
     Tuple,
     Type,
     Union,
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import (
     ColumnProperty,
     RelationshipProperty,
+    MapperProperty,
     selectinload,
     sessionmaker,
 )
@@ -33,7 +35,7 @@ from starlette.responses import StreamingResponse
 from wtforms import Field, Form
 
 from sqladmin.exceptions import InvalidColumnError, InvalidModelError
-from sqladmin.forms import get_model_form
+from sqladmin.forms import get_model_form, AdminAttribute
 from sqladmin.helpers import (
     Writer,
     as_str,
@@ -47,6 +49,8 @@ from sqladmin.pagination import Pagination
 __all__ = [
     "ModelAdmin",
 ]
+
+T = TypeVar("V")
 
 
 class ModelAdminMeta(type):
@@ -422,6 +426,13 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
     """
 
     def __init__(self) -> None:
+
+        self._admin_attributes: Dict[Union[str, InstrumentedAttribute], AdminAttribute] = {}
+
+        self._list_admin_attributes = [
+            self.get_admin_attr(key) for key in self.column_list
+        ]
+
         self._column_labels = self.get_column_labels()
 
         self._list_attrs = self.get_list_columns()
@@ -453,14 +464,72 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         self._export_attrs = self.get_export_columns()
 
         self._search_fields = [
-            getattr(self.model, self.get_model_attr(attr).key)
+            getattr(self.model, self.get_sqla_model_prop(attr).key)
             for attr in self.column_searchable_list or []
         ]
 
         self._sort_fields = [
-            getattr(self.model, self.get_model_attr(attr).key)
+            getattr(self.model, self.get_sqla_model_prop(attr).key)
             for attr in self.column_sortable_list or []
         ]
+
+    def get_admin_attr(self, key: Union[str, InstrumentedAttribute]) -> AdminAttribute:
+        val = self._admin_attributes.get(key)
+        if val is None:
+            self._set_admin_attr(key)
+            val = self._admin_attributes.get(key)
+        return val
+
+    @staticmethod
+    def _get_key_and_ia(
+            model: type,
+            v: Union[str, InstrumentedAttribute]
+    ) -> Tuple[str, InstrumentedAttribute]:
+        if isinstance(v, str):
+            return v, getattr(model, v)
+        elif isinstance(v, InstrumentedAttribute):
+            return v.key, v
+        else:
+            raise TypeError(
+                f"Input must be str or InstrumentedAttribute; received {type(v)!r}."
+            )
+
+    def _lookup_sqla_column_key(
+            self,
+            mapping: Dict[Union[str, InstrumentedAttribute], T],
+            key: Union[str, InstrumentedAttribute]
+    ) -> T:
+        """Does a lookup on a dict with `Union[str, InstrumentedAttribute]` keys.
+        The point is that this works even if the key lookup and key storage types are
+        mismatched.
+        """
+        if key in mapping:
+            return mapping[key]
+        if isinstance(key, str):
+            key2: InstrumentedAttribute = getattr(self.model, key)
+            return mapping.get(key2)
+        elif isinstance(key, InstrumentedAttribute):
+            key2 = key.key
+            return mapping.get(key2)
+        else:
+            raise TypeError(
+                f"Input must be str or InstrumentedAttribute; received {type(v)!r}."
+            )
+
+    def _set_admin_attr(self, key: Union[str, InstrumentedAttribute]) -> None:
+        """Doesn't ever need to be directly called."""
+        key, ia = self._get_key_and_ia(self.model, key)
+
+        attr = AdminAttribute(
+            sqla_model=self.model,
+            sqla_attribute=key,
+            label=self._lookup_sqla_column_key(self.column_labels, key),
+            wtf_field_type_override=self._lookup_sqla_column_key(self.form_overrides, key),
+            wtf_extra_field_kwargs=self._lookup_sqla_column_key(self.form_args, key)
+        )
+
+        self._admin_attributes[key] = attr
+        self._admin_attributes[ia] = attr
 
     def _run_query_sync(self, stmt: ClauseElement) -> Any:
         with self.sessionmaker(expire_on_commit=False) as session:
@@ -509,12 +578,12 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         return rows[0]
 
     async def list(
-        self,
-        page: int,
-        page_size: int,
-        search: Optional[str] = None,
-        sort_by: Optional[str] = None,
-        sort: str = "asc",
+            self,
+            page: int,
+            page_size: int,
+            search: Optional[str] = None,
+            sort_by: Optional[str] = None,
+            sort: str = "asc",
     ) -> Pagination:
         page_size = min(page_size or self.page_size, max(self.page_size_options))
 
@@ -524,7 +593,7 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         for _, relation in self._list_relations:
             stmt = stmt.options(selectinload(relation.key))
 
-        sort_field = self.get_model_attr(sort_by) if sort_by else self.pk_column
+        sort_field = self.get_sqla_model_prop(sort_by) if sort_by else self.pk_column
         if sort == "desc":
             stmt = stmt.order_by(desc(sort_field))
         else:
@@ -569,7 +638,7 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         return None
 
     def get_attr_value(
-        self, obj: type, attr: Union[Column, ColumnProperty, RelationshipProperty]
+            self, obj: type, attr: Union[Column, ColumnProperty, RelationshipProperty]
     ) -> Any:
         if isinstance(attr, Column):
             return getattr(obj, attr.name)
@@ -581,19 +650,19 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
                 return value.value
             return value
 
-    def get_model_attr(
-        self, attr: Union[str, InstrumentedAttribute]
+    def get_sqla_model_prop(
+            self, attr: Union[str, InstrumentedAttribute]
     ) -> Union[ColumnProperty, RelationshipProperty]:
         assert isinstance(attr, (str, InstrumentedAttribute))
 
         if isinstance(attr, str):
             key = attr
-        elif isinstance(attr.prop, ColumnProperty):
-            key = attr.key
-        elif isinstance(attr.prop, RelationshipProperty):
+        else:
             key = attr.prop.key
-
         try:
+            # Sqla naming is inconsistent?
+            # these attrs are actually properties, which are
+            # distinct things in the SQLAlchemy world.
             return inspect(self.model).attrs[key]
         except KeyError:
             raise InvalidColumnError(
@@ -604,18 +673,18 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         return list(inspect(self.model).attrs)
 
     def _build_column_list(
-        self,
-        include: Optional[Sequence[Union[str, InstrumentedAttribute]]] = None,
-        exclude: Optional[Sequence[Union[str, InstrumentedAttribute]]] = None,
-        default: Callable[[], List[Column]] = None,
+            self,
+            include: Optional[Sequence[Union[str, InstrumentedAttribute]]] = None,
+            exclude: Optional[Sequence[Union[str, InstrumentedAttribute]]] = None,
+            default: Callable[[], List[Column]] = None,
     ) -> List[Tuple[str, Column]]:
         """This function generalizes constructing a list of columns
         for any sequence of inclusions or exclusions.
         """
         if include:
-            attrs = [self.get_model_attr(attr) for attr in include]
+            attrs = [self.get_sqla_model_prop(attr) for attr in include]
         elif exclude:
-            exclude_columns = [self.get_model_attr(attr) for attr in exclude]
+            exclude_columns = [self.get_sqla_model_prop(attr) for attr in exclude]
             all_attrs = self.get_model_attributes()
             attrs = list(set(all_attrs) - set(exclude_columns))
         else:
@@ -675,7 +744,7 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
 
     def get_column_labels(self) -> Dict[Column, str]:
         return {
-            self.get_model_attr(column_label): value
+            self.get_sqla_model_prop(column_label): value
             for column_label, value in self.column_labels.items()
         }
 
@@ -741,7 +810,7 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         """
 
         search_fields = [
-            self.get_model_attr(attr) for attr in self.column_searchable_list
+            self.get_sqla_model_prop(attr) for attr in self.column_searchable_list
         ]
         field_names = [
             self._column_labels.get(field, field.key) for field in search_fields
@@ -754,9 +823,9 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
         return filename
 
     def export_data(
-        self,
-        data: List[Any],
-        export_type: str = "csv",
+            self,
+            data: List[Any],
+            export_type: str = "csv",
     ) -> StreamingResponse:
         if export_type == "csv":
             return self._export_csv(data)
@@ -764,8 +833,8 @@ class ModelAdmin(BaseModelAdmin, metaclass=ModelAdminMeta):
             raise NotImplementedError("Only export_type='csv' is implemented.")
 
     def _export_csv(
-        self,
-        data: List[Any],
+            self,
+            data: List[Any],
     ) -> StreamingResponse:
         def generate(writer: Writer) -> Generator[List[str], None, None]:
             # Append the column titles at the beginning
